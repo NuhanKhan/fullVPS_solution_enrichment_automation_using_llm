@@ -1,0 +1,236 @@
+import logging
+import os
+
+from googleapiclient.discovery import Resource
+from mistralai.client import Mistral
+from openai import OpenAI
+
+from cache import cache_key, load_cached, save_cached
+from config import CACHE_DIR, COMPLAINT_LINK_COLUMN, PROMPTS_DIR, WRITE_EVERY_ROWS
+from email_lookup import fill_missing_emails
+from extract import extract_case
+from format_output import build_output_rows
+from pdf_text import get_pdf_text
+from prompt_template import load_prompt
+from sheet_link import parse_sheet_link, pick_input_tab
+from sheets import (
+    ensure_tab,
+    get_service_account_email,
+    get_sheet_values,
+    get_tabs,
+    quote_tab,
+    rows_to_dicts,
+    write_rows,
+)
+
+
+def should_process(row: dict, link_column: str) -> bool:
+    link = row.get(link_column, "").strip()
+    return link.startswith("http")
+
+
+def select_rows(rows: list[dict], link_column: str, start_row: int, limit: int | None) -> list[dict]:
+    """Rows to run, in sheet order. The limit counts only rows that will actually be processed."""
+
+    selected = []
+    for row in rows:
+        if row["row_index"] < start_row:
+            continue
+        if not should_process(row, link_column):
+            continue
+        if limit is not None and len(selected) >= limit:
+            break
+        selected.append(row)
+    return selected
+
+
+def row_failed(output_rows: list[dict]) -> bool:
+    first = output_rows[0]
+    return bool(first["download_error"] or first["extract_error"])
+
+
+def load_prompts(expert: str) -> tuple[dict | None, str | None]:
+    paths = {
+        "expert": os.path.join(PROMPTS_DIR, "experts", f"{expert}.txt"),
+        "lookup_system": os.path.join(PROMPTS_DIR, "email_lookup_system.txt"),
+        "lookup_user": os.path.join(PROMPTS_DIR, "email_lookup_user.txt"),
+    }
+    prompts = {}
+    for name, path in paths.items():
+        text, error = load_prompt(path)
+        if error:
+            return (None, f"prompt {path}: {error}")
+        prompts[name] = text
+    return (prompts, None)
+
+
+def row_warned(output_rows: list[dict]) -> bool:
+    return bool(output_rows[0].get("extract_warning"))
+
+
+def lookup_still_owed(cached: dict, lookup_enabled: bool) -> bool:
+    """A row cached during a --no-email-lookup run gets its lookup the next time lookup is on.
+
+    Entries from before the switch existed have no email_lookup key; they were made with lookup on.
+    """
+
+    return lookup_enabled and not cached.get("email_lookup", True)
+
+
+def lookup_and_cache(openrouter_client: OpenAI, prompts: dict, row_index: int, key: str, entry: dict,
+                     lookup_enabled: bool) -> tuple[dict, float]:
+    """Run the email lookup on entry["extract"], then cache the entry. Returns (extract, lookup cost)."""
+
+    extract, cost, lookup_errors = fill_missing_emails(
+        openrouter_client, prompts["lookup_system"], prompts["lookup_user"], entry["extract"], lookup_enabled,
+    )
+    for lookup_error in lookup_errors:
+        logging.error(f"row {row_index}: {lookup_error}")
+
+    # A failed lookup is not cached, so the next run tries it again
+    if not lookup_errors:
+        new_entry = {**entry, "cost": entry["cost"] + cost, "email_lookup": lookup_enabled, "extract": extract}
+        _, error = save_cached(CACHE_DIR, key, new_entry)
+        if error:
+            logging.warning(f"row {row_index}: not cached: {error}")
+
+    return (extract, cost)
+
+
+def process_row(mistral_client: Mistral, openrouter_client: OpenAI, prompts: dict, expert: str,
+                row: dict, lookup_enabled: bool) -> tuple[list[dict], float]:
+    """Run one input row end to end. Returns (output rows, dollars spent on this row).
+
+    Never raises, a failure becomes an output row with the error. A cache hit costs 0.0, unless the
+    row was cached with lookup off and lookup is now on, then only the lookup is paid for.
+    """
+
+    row_index = row["row_index"]
+    url = row[COMPLAINT_LINK_COLUMN].strip()
+    key = cache_key(expert, url)
+
+    cached, error = load_cached(CACHE_DIR, key)
+    if error:
+        logging.warning(f"row {row_index}: unreadable cache entry, processing again: {error}")
+    if cached:
+        pdf_result = {"text": "", "source": cached["source"], "error": None, "cost": 0.0}
+        extract = cached["extract"]
+        cost = 0.0
+        if lookup_still_owed(cached, lookup_enabled):
+            logging.info(f"row {row_index}: cache hit, running the email lookup it skipped before")
+            entry = {**cached, "cost": cached.get("cost", 0.0)}
+            extract, cost = lookup_and_cache(openrouter_client, prompts, row_index, key, entry, lookup_enabled)
+            logging.info(f"row {row_index}: cost ${cost:.4f}")
+        else:
+            logging.info(f"row {row_index}: cache hit, no paid calls")
+        return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, extract, None), cost)
+
+    pdf_result = get_pdf_text(mistral_client, url)
+    cost = pdf_result["cost"]
+    if pdf_result["error"]:
+        logging.error(f"row {row_index}: {pdf_result['error']}")
+        return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, None, None), cost)
+    logging.info(f"row {row_index}: {pdf_result['source']} text, {len(pdf_result['text'])} chars")
+
+    extract, extract_cost, error = extract_case(openrouter_client, prompts["expert"], pdf_result["text"], row_index)
+    cost += extract_cost
+    if error:
+        logging.error(f"row {row_index}: extract: {error} (${cost:.4f} spent)")
+        return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, None, error), cost)
+    logging.info(f"row {row_index}: {extract.get('expert_fit')}, {len(extract['attorneys'])} attorneys")
+    if extract["extract_warning"]:
+        logging.warning(f"row {row_index}: {extract['extract_warning']}, data kept")
+
+    entry = {"url": url, "expert": expert, "source": pdf_result["source"], "cost": cost, "extract": extract}
+    extract, lookup_cost = lookup_and_cache(openrouter_client, prompts, row_index, key, entry, lookup_enabled)
+    cost += lookup_cost
+
+    logging.info(f"row {row_index}: cost ${cost:.4f}")
+    return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, extract, None), cost)
+
+
+def open_sheet(service: Resource, link: str, input_tab: str | None) -> tuple[dict | None, str | None]:
+    """Turn the --link (and optional --input-tab) into {"sheet_id", "input_tab"}."""
+
+    parsed, error = parse_sheet_link(link)
+    if error:
+        return (None, error)
+
+    tabs, error = get_tabs(service, parsed["sheet_id"])
+    if error:
+        email, _ = get_service_account_email()
+        return (None, f"cannot open the sheet ({error}). Is it shared with {email}?")
+
+    tab, error = pick_input_tab(tabs, parsed["gid"], input_tab)
+    if error:
+        return (None, error)
+
+    return ({"sheet_id": parsed["sheet_id"], "input_tab": tab}, None)
+
+
+def run_pipeline(service: Resource, mistral_client: Mistral, openrouter_client: OpenAI, link: str, expert: str,
+                 input_tab: str | None, output_tab: str, start_row: int, limit: int | None,
+                 lookup_enabled: bool) -> tuple[dict | None, str | None]:
+    """Open the sheet from its link, process each row of the input tab, write results every WRITE_EVERY_ROWS rows.
+
+    Returns (summary counts, None), or (None, error) when the run cannot start or a write fails.
+    """
+
+    prompts, error = load_prompts(expert)
+    if error:
+        return (None, error)
+
+    sheet, error = open_sheet(service, link, input_tab)
+    if error:
+        return (None, error)
+    sheet_id = sheet["sheet_id"]
+    input_tab = sheet["input_tab"]
+    if input_tab == output_tab:
+        return (None, f"input and output tab are both {input_tab!r}, the results would be appended to the input")
+    logging.info(f"sheet {sheet_id}, input tab {input_tab!r}, output tab {output_tab!r}")
+
+    values, error = get_sheet_values(service, sheet_id, quote_tab(input_tab))
+    if error:
+        return (None, f"read {input_tab}: {error}")
+
+    rows, error = rows_to_dicts(values)
+    if error:
+        return (None, f"input tab {input_tab}: {error}")
+    if COMPLAINT_LINK_COLUMN not in values[0]:
+        return (None, f"input tab {input_tab} has no '{COMPLAINT_LINK_COLUMN}' column")
+
+    # Before any paid call, so a bad output tab never wastes a run
+    _, error = ensure_tab(service, sheet_id, output_tab)
+    if error:
+        return (None, f"output tab {output_tab}: {error}")
+
+    selected = select_rows(rows, COMPLAINT_LINK_COLUMN, start_row, limit)
+    lookup_state = "on"
+    if not lookup_enabled:
+        lookup_state = "off"
+    logging.info(f"{len(selected)} rows to process from {input_tab}, expert {expert}, email lookup {lookup_state}")
+
+    summary = {"processed": 0, "failed": 0, "warnings": 0, "rows_written": 0, "cost_usd": 0.0}
+    pending = []
+
+    for count, row in enumerate(selected, start=1):
+        output_rows, cost = process_row(mistral_client, openrouter_client, prompts, expert, row, lookup_enabled)
+        pending.extend(output_rows)
+        summary["processed"] += 1
+        summary["cost_usd"] += cost
+        if row_failed(output_rows):
+            summary["failed"] += 1
+        if row_warned(output_rows):
+            summary["warnings"] += 1
+
+        if count % WRITE_EVERY_ROWS == 0 or count == len(selected):
+            written, error = write_rows(service, sheet_id, output_tab, pending)
+            if error:
+                return (None, f"write {output_tab} after {count} rows: {error}")
+            summary["rows_written"] += written
+            logging.info(f"wrote {written} rows to {output_tab} ({count} of {len(selected)} input rows done, "
+                         f"${summary['cost_usd']:.4f} so far)")
+            pending = []
+
+    summary["cost_usd"] = round(summary["cost_usd"], 4)
+    return (summary, None)

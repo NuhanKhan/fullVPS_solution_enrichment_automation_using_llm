@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets: API keys and Google credentials, under any name
+.env
+.env.*
+!.env.example
+service_account.json
+*service_account*.json
+*service-account*.json
+
+# Pipeline output and cache (the cache holds client case data)
+.cache/
+output/
+*.tmp
+*.log
+
+# Claude Code: project memory and local settings
+CLAUDE.md
+.claude/
+
+# Tool caches
+.ruff_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

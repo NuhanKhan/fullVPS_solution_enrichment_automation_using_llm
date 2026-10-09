@@ -1,0 +1,1 @@
+Find the email address for attorney {{first_name}} {{last_name}}. Law firm: {{firm}}. Law firm address: {{address}}. Phone: {{phone}}. IMPORTANT: Visit the attorney's bio page on their law firm website and look for their email address in the page content. Also search state bar directory, LinkedIn, Avvo, and Martindale-Hubbell.
