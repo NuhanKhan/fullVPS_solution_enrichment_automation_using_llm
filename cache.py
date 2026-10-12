@@ -10,6 +10,12 @@ def cache_key(expert: str, url: str) -> str:
     return hashlib.sha256(f"{expert}\n{url.strip()}".encode()).hexdigest()
 
 
+def text_key(url: str) -> str:
+    """OCR text belongs to the document, not to an expert or a prompt, so only the URL goes in the key."""
+
+    return hashlib.sha256(f"text\n{url.strip()}".encode()).hexdigest()
+
+
 def load_cached(cache_dir: str, key: str) -> tuple[dict | None, str | None]:
     """Returns (entry, None) on a hit, (None, None) on a miss, (None, error) if the file is unreadable."""
 
@@ -40,4 +46,15 @@ def save_cached(cache_dir: str, key: str, entry: dict) -> tuple[str | None, str 
         return (path, None)
     except OSError as e:
         logging.error(f"Error writing cache file {path}: {e}")
+        return (None, str(e))
+
+
+def touch_cached(cache_dir: str, key: str) -> tuple[bool | None, str | None]:
+    """Mark an entry as used now, so the age based prune only removes entries nobody has needed lately."""
+
+    path = os.path.join(cache_dir, f"{key}.json")
+    try:
+        os.utime(path)
+        return (True, None)
+    except OSError as e:
         return (None, str(e))

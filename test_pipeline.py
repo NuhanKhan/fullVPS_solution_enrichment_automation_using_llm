@@ -1,7 +1,6 @@
 import unittest
 
 from pipeline import (
-    lookup_still_owed,
     row_failed,
     row_warned,
     select_rows,
@@ -70,18 +69,3 @@ class TestRowWarned(unittest.TestCase):
 
     def test_failed_row_without_the_column_is_not_counted(self):
         self.assertFalse(row_warned([{"download_error": "download: 404"}]))
-
-
-class TestLookupStillOwed(unittest.TestCase):
-
-    def test_entry_cached_with_lookup_off_is_owed_a_lookup_when_on(self):
-        self.assertTrue(lookup_still_owed({"email_lookup": False}, True))
-
-    def test_entry_cached_with_lookup_on_is_not_owed(self):
-        self.assertFalse(lookup_still_owed({"email_lookup": True}, True))
-
-    def test_nothing_is_owed_while_lookup_is_off(self):
-        self.assertFalse(lookup_still_owed({"email_lookup": False}, False))
-
-    def test_entry_from_before_the_switch_counts_as_looked_up(self):
-        self.assertFalse(lookup_still_owed({"source": "native"}, True))

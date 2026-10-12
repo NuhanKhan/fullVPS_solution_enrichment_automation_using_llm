@@ -1,6 +1,6 @@
 import unittest
 
-from prompt_template import fill_template
+from prompt_template import fill_template, prompt_version
 
 
 class TestFillTemplate(unittest.TestCase):
@@ -26,6 +26,23 @@ class TestFillTemplate(unittest.TestCase):
     def test_placeholder_text_inside_a_value_is_not_replaced(self):
         result = fill_template("{{text}} / {{n}}", {"text": "doc says {{n}}", "n": 1})
         self.assertEqual(result, ("doc says {{n}} / 1", None))
+
+
+class TestPromptVersion(unittest.TestCase):
+
+    def test_same_text_gives_the_same_version(self):
+        self.assertEqual(prompt_version("Score the case."), prompt_version("Score the case."))
+
+    def test_a_changed_word_gives_a_new_version(self):
+        self.assertNotEqual(prompt_version("Score the case."), prompt_version("Score the claim."))
+
+    def test_spacing_and_line_breaks_do_not_count_as_a_change(self):
+        self.assertEqual(prompt_version("Score the case.\n"), prompt_version("Score   the\r\ncase."))
+
+    def test_version_is_twelve_hex_characters(self):
+        version = prompt_version("Score the case.")
+        self.assertEqual(len(version), 12)
+        int(version, 16)
 
 
 if __name__ == "__main__":

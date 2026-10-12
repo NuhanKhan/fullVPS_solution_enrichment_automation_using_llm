@@ -18,7 +18,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-row", type=int, default=2, help="first sheet row to process")
     parser.add_argument("--limit", type=int, default=None, help="max rows to process")
     parser.add_argument("--no-email-lookup", action="store_true", help="skip the paid Perplexity email lookup")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show what the run would do and roughly cost, then stop. Nothing is paid or written")
+    parser.add_argument("--max-cost", type=float, default=None, help="stop once this many dollars are spent")
+    prompt_change = parser.add_mutually_exclusive_group()
+    prompt_change.add_argument("--redo-changed", action="store_true",
+                               help="extract again the rows made with an older version of the prompt (paid)")
+    prompt_change.add_argument("--keep-old", action="store_true",
+                               help="use the cached answers from an older version of the prompt (free)")
     return parser.parse_args()
+
+
+def prompt_change_mode(args: argparse.Namespace) -> str:
+    if args.redo_changed:
+        return "redo"
+    if args.keep_old:
+        return "keep"
+    return "stop"
 
 
 def main():
@@ -36,6 +52,7 @@ def main():
     summary, error = run_pipeline(
         service, mistral_client, openrouter_client, args.link, args.expert,
         args.input_tab, args.output_tab, args.start_row, args.limit, not args.no_email_lookup,
+        prompt_change_mode(args), args.dry_run, args.max_cost,
     )
     if error:
         logging.error(error)

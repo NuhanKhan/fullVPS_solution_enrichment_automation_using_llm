@@ -1,7 +1,9 @@
+import hashlib
 import logging
 import re
 
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+PROMPT_VERSION_LENGTH = 12
 
 
 def load_prompt(path: str) -> tuple[str | None, str | None]:
@@ -32,3 +34,10 @@ def fill_template(template: str, values: dict) -> tuple[str | None, str | None]:
     filled = PLACEHOLDER.sub(lambda match: str(values[match.group(1)]), template)
 
     return (filled, None)
+
+
+def prompt_version(template: str) -> str:
+    """Short fingerprint of a prompt. Spacing and line breaks are ignored, any changed word gives a new one."""
+
+    words = " ".join(template.split())
+    return hashlib.sha256(words.encode()).hexdigest()[:PROMPT_VERSION_LENGTH]

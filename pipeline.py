@@ -5,13 +5,28 @@ from googleapiclient.discovery import Resource
 from mistralai.client import Mistral
 from openai import OpenAI
 
-from cache import cache_key, load_cached, save_cached
-from config import CACHE_DIR, COMPLAINT_LINK_COLUMN, PROMPTS_DIR, WRITE_EVERY_ROWS
+from cache import cache_key, load_cached, save_cached, text_key, touch_cached
+from config import (
+    CACHE_DIR,
+    COMPLAINT_LINK_COLUMN,
+    ESTIMATED_COST_PER_ROW,
+    OCR_CACHE_DIR,
+    PROMPTS_DIR,
+    WRITE_EVERY_ROWS,
+)
 from email_lookup import fill_missing_emails
 from extract import extract_case
 from format_output import build_output_rows
 from pdf_text import get_pdf_text
-from prompt_template import load_prompt
+from prompt_template import load_prompt, prompt_version
+from run_plan import (
+    count_statuses,
+    estimate_cost,
+    lookup_still_owed,
+    plan_message,
+    prompt_change_error,
+    row_status,
+)
 from sheet_link import parse_sheet_link, pick_input_tab
 from sheets import (
     ensure_tab,
@@ -61,20 +76,12 @@ def load_prompts(expert: str) -> tuple[dict | None, str | None]:
         if error:
             return (None, f"prompt {path}: {error}")
         prompts[name] = text
+    prompts["expert_version"] = prompt_version(prompts["expert"])
     return (prompts, None)
 
 
 def row_warned(output_rows: list[dict]) -> bool:
     return bool(output_rows[0].get("extract_warning"))
-
-
-def lookup_still_owed(cached: dict, lookup_enabled: bool) -> bool:
-    """A row cached during a --no-email-lookup run gets its lookup the next time lookup is on.
-
-    Entries from before the switch existed have no email_lookup key; they were made with lookup on.
-    """
-
-    return lookup_enabled and not cached.get("email_lookup", True)
 
 
 def lookup_and_cache(openrouter_client: OpenAI, prompts: dict, row_index: int, key: str, entry: dict,
@@ -97,12 +104,58 @@ def lookup_and_cache(openrouter_client: OpenAI, prompts: dict, row_index: int, k
     return (extract, cost)
 
 
+def get_text(mistral_client: Mistral, row_index: int, url: str) -> dict:
+    """get_pdf_text, but OCR text is kept by URL, so a scanned document is never OCR'd twice."""
+
+    key = text_key(url)
+    stored, error = load_cached(OCR_CACHE_DIR, key)
+    if error:
+        logging.warning(f"row {row_index}: unreadable OCR text file, reading the PDF again: {error}")
+    if stored:
+        touch_cached(OCR_CACHE_DIR, key)
+        logging.info(f"row {row_index}: OCR text reused, no OCR paid")
+        return {"text": stored["text"], "source": "ocr", "error": None, "cost": 0.0}
+
+    pdf_result = get_pdf_text(mistral_client, url)
+    if pdf_result["source"] == "ocr" and not pdf_result["error"]:
+        stored = {"url": url, "cost": pdf_result["cost"], "text": pdf_result["text"]}
+        _, error = save_cached(OCR_CACHE_DIR, key, stored)
+        if error:
+            logging.warning(f"row {row_index}: OCR text not kept: {error}")
+    return pdf_result
+
+
+def use_cached(openrouter_client: OpenAI, prompts: dict, expert: str, row: dict, key: str, cached: dict,
+               lookup_enabled: bool) -> tuple[list[dict], float]:
+    """Build the row from its cache entry. Only an owed email lookup is paid for."""
+
+    row_index = row["row_index"]
+    pdf_result = {"text": "", "source": cached["source"], "error": None, "cost": 0.0}
+    entry = {**cached, "cost": cached.get("cost", 0.0)}
+
+    if lookup_still_owed(cached, lookup_enabled):
+        logging.info(f"row {row_index}: cache hit, running the email lookup it skipped before")
+        extract, cost = lookup_and_cache(openrouter_client, prompts, row_index, key, entry, lookup_enabled)
+        logging.info(f"row {row_index}: cost ${cost:.4f}")
+        return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, extract, None), cost)
+
+    _, error = touch_cached(CACHE_DIR, key)
+    if error:
+        logging.warning(f"row {row_index}: could not mark cache entry as used: {error}")
+    if cached.get("prompt_version") == prompts["expert_version"]:
+        logging.info(f"row {row_index}: cache hit, no paid calls")
+    else:
+        logging.info(f"row {row_index}: cache hit from prompt {cached.get('prompt_version')}, kept (--keep-old)")
+    return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, cached["extract"], None), 0.0)
+
+
 def process_row(mistral_client: Mistral, openrouter_client: OpenAI, prompts: dict, expert: str,
-                row: dict, lookup_enabled: bool) -> tuple[list[dict], float]:
+                row: dict, lookup_enabled: bool, redo_changed: bool) -> tuple[list[dict], float]:
     """Run one input row end to end. Returns (output rows, dollars spent on this row).
 
     Never raises, a failure becomes an output row with the error. A cache hit costs 0.0, unless the
-    row was cached with lookup off and lookup is now on, then only the lookup is paid for.
+    row was cached with lookup off and lookup is now on, then only the lookup is paid for. A row made
+    with another version of the prompt is extracted again only when redo_changed is set.
     """
 
     row_index = row["row_index"]
@@ -113,19 +166,11 @@ def process_row(mistral_client: Mistral, openrouter_client: OpenAI, prompts: dic
     if error:
         logging.warning(f"row {row_index}: unreadable cache entry, processing again: {error}")
     if cached:
-        pdf_result = {"text": "", "source": cached["source"], "error": None, "cost": 0.0}
-        extract = cached["extract"]
-        cost = 0.0
-        if lookup_still_owed(cached, lookup_enabled):
-            logging.info(f"row {row_index}: cache hit, running the email lookup it skipped before")
-            entry = {**cached, "cost": cached.get("cost", 0.0)}
-            extract, cost = lookup_and_cache(openrouter_client, prompts, row_index, key, entry, lookup_enabled)
-            logging.info(f"row {row_index}: cost ${cost:.4f}")
-        else:
-            logging.info(f"row {row_index}: cache hit, no paid calls")
-        return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, extract, None), cost)
+        if row_status(cached, prompts["expert_version"], lookup_enabled) != "prompt changed" or not redo_changed:
+            return use_cached(openrouter_client, prompts, expert, row, key, cached, lookup_enabled)
+        logging.info(f"row {row_index}: prompt changed since {cached.get('prompt_version')}, extracting again")
 
-    pdf_result = get_pdf_text(mistral_client, url)
+    pdf_result = get_text(mistral_client, row_index, url)
     cost = pdf_result["cost"]
     if pdf_result["error"]:
         logging.error(f"row {row_index}: {pdf_result['error']}")
@@ -141,12 +186,23 @@ def process_row(mistral_client: Mistral, openrouter_client: OpenAI, prompts: dic
     if extract["extract_warning"]:
         logging.warning(f"row {row_index}: {extract['extract_warning']}, data kept")
 
-    entry = {"url": url, "expert": expert, "source": pdf_result["source"], "cost": cost, "extract": extract}
+    entry = {"url": url, "expert": expert, "prompt_version": prompts["expert_version"],
+             "source": pdf_result["source"], "cost": cost, "extract": extract}
     extract, lookup_cost = lookup_and_cache(openrouter_client, prompts, row_index, key, entry, lookup_enabled)
     cost += lookup_cost
 
     logging.info(f"row {row_index}: cost ${cost:.4f}")
     return (build_output_rows(expert, row, COMPLAINT_LINK_COLUMN, pdf_result, extract, None), cost)
+
+
+def plan_rows(selected: list[dict], expert: str, current_version: str, lookup_enabled: bool) -> list[str]:
+    """What the run would do with each selected row, read from the cache only. Free."""
+
+    statuses = []
+    for row in selected:
+        cached, _ = load_cached(CACHE_DIR, cache_key(expert, row[COMPLAINT_LINK_COLUMN].strip()))
+        statuses.append(row_status(cached, current_version, lookup_enabled))
+    return statuses
 
 
 def open_sheet(service: Resource, link: str, input_tab: str | None) -> tuple[dict | None, str | None]:
@@ -170,8 +226,13 @@ def open_sheet(service: Resource, link: str, input_tab: str | None) -> tuple[dic
 
 def run_pipeline(service: Resource, mistral_client: Mistral, openrouter_client: OpenAI, link: str, expert: str,
                  input_tab: str | None, output_tab: str, start_row: int, limit: int | None,
-                 lookup_enabled: bool) -> tuple[dict | None, str | None]:
+                 lookup_enabled: bool, prompt_change: str, dry_run: bool,
+                 max_cost: float | None) -> tuple[dict | None, str | None]:
     """Open the sheet from its link, process each row of the input tab, write results every WRITE_EVERY_ROWS rows.
+
+    prompt_change is "stop" (refuse to start if any row was made with another prompt version), "redo" or
+    "keep". A dry run logs the plan and stops before anything is created or paid for. max_cost stops the
+    run once that many dollars are spent.
 
     Returns (summary counts, None), or (None, error) when the run cannot start or a write fails.
     """
@@ -199,22 +260,34 @@ def run_pipeline(service: Resource, mistral_client: Mistral, openrouter_client: 
     if COMPLAINT_LINK_COLUMN not in values[0]:
         return (None, f"input tab {input_tab} has no '{COMPLAINT_LINK_COLUMN}' column")
 
-    # Before any paid call, so a bad output tab never wastes a run
-    _, error = ensure_tab(service, sheet_id, output_tab)
-    if error:
-        return (None, f"output tab {output_tab}: {error}")
-
     selected = select_rows(rows, COMPLAINT_LINK_COLUMN, start_row, limit)
     lookup_state = "on"
     if not lookup_enabled:
         lookup_state = "off"
     logging.info(f"{len(selected)} rows to process from {input_tab}, expert {expert}, email lookup {lookup_state}")
 
-    summary = {"processed": 0, "failed": 0, "warnings": 0, "rows_written": 0, "cost_usd": 0.0}
+    counts = count_statuses(plan_rows(selected, expert, prompts["expert_version"], lookup_enabled))
+    estimate = estimate_cost(counts, prompt_change, ESTIMATED_COST_PER_ROW)
+    logging.info(plan_message(counts, prompts["expert_version"], prompt_change, estimate))
+    stop_error = prompt_change_error(counts, prompt_change)
+    if dry_run:
+        if stop_error:
+            logging.warning(f"a real run would stop here: {stop_error}")
+        return ({"dry_run": True, **counts, "estimated_cost_usd": round(estimate, 4)}, None)
+    if stop_error:
+        return (None, stop_error)
+
+    # Before any paid call, so a bad output tab never wastes a run
+    _, error = ensure_tab(service, sheet_id, output_tab)
+    if error:
+        return (None, f"output tab {output_tab}: {error}")
+
+    summary = {"processed": 0, "failed": 0, "warnings": 0, "rows_written": 0, "cost_usd": 0.0, "stopped_early": False}
     pending = []
 
     for count, row in enumerate(selected, start=1):
-        output_rows, cost = process_row(mistral_client, openrouter_client, prompts, expert, row, lookup_enabled)
+        output_rows, cost = process_row(mistral_client, openrouter_client, prompts, expert, row, lookup_enabled,
+                                        prompt_change == "redo")
         pending.extend(output_rows)
         summary["processed"] += 1
         summary["cost_usd"] += cost
@@ -223,7 +296,8 @@ def run_pipeline(service: Resource, mistral_client: Mistral, openrouter_client: 
         if row_warned(output_rows):
             summary["warnings"] += 1
 
-        if count % WRITE_EVERY_ROWS == 0 or count == len(selected):
+        over_budget = max_cost is not None and summary["cost_usd"] >= max_cost and count < len(selected)
+        if count % WRITE_EVERY_ROWS == 0 or count == len(selected) or over_budget:
             written, error = write_rows(service, sheet_id, output_tab, pending)
             if error:
                 return (None, f"write {output_tab} after {count} rows: {error}")
@@ -231,6 +305,12 @@ def run_pipeline(service: Resource, mistral_client: Mistral, openrouter_client: 
             logging.info(f"wrote {written} rows to {output_tab} ({count} of {len(selected)} input rows done, "
                          f"${summary['cost_usd']:.4f} so far)")
             pending = []
+
+        if over_budget:
+            logging.warning(f"stopping: ${summary['cost_usd']:.4f} spent, --max-cost is ${max_cost:.2f}. "
+                            f"Continue with --start-row {row['row_index'] + 1}")
+            summary["stopped_early"] = True
+            break
 
     summary["cost_usd"] = round(summary["cost_usd"], 4)
     return (summary, None)

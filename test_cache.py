@@ -1,6 +1,6 @@
 import unittest
 
-from cache import cache_key
+from cache import cache_key, text_key
 
 
 class TestCacheKey(unittest.TestCase):
@@ -20,3 +20,12 @@ class TestCacheKey(unittest.TestCase):
     def test_key_is_safe_as_a_file_name(self):
         key = cache_key("ariel", "https://x.com/a.pdf?id=1&x=/../")
         self.assertTrue(key.isalnum())
+
+
+class TestTextKey(unittest.TestCase):
+
+    def test_same_url_gives_the_same_key_for_every_expert(self):
+        self.assertEqual(text_key("https://x.com/a.pdf"), text_key(" https://x.com/a.pdf "))
+
+    def test_text_key_never_collides_with_an_extract_key(self):
+        self.assertNotEqual(text_key("https://x.com/a.pdf"), cache_key("", "https://x.com/a.pdf"))

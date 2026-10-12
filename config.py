@@ -54,3 +54,6 @@ WRITE_EVERY_ROWS = 10
 # Local paths
 PROMPTS_DIR = "prompts"
 CACHE_DIR = ".cache"
+CACHE_MAX_AGE_DAYS = 90  # cache_tool.py prune default: entries not written or used for this many days
+OCR_CACHE_DIR = ".cache/ocr"  # OCR text by PDF link, reused when a prompt changes so OCR is never paid twice
+ESTIMATED_COST_PER_ROW = 0.012  # for the run plan only; 2026-10-08 runs averaged $0.008 and $0.0117 per complaint

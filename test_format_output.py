@@ -1,9 +1,12 @@
 import glob
+import itertools
 import json
 import os
+import re
 import unittest
 
 from config import PROMPTS_DIR
+from extract import build_extract_prompt
 from format_output import build_output_rows, format_value
 
 INPUT_ROW = {"row_index": 7, "Complaint Link": "https://x.com/a.pdf", "Case Name": "Smith"}
@@ -19,6 +22,88 @@ def prompt_schema(path: str) -> dict:
     start = text.index("{", marker)
     schema, _ = json.JSONDecoder().raw_decode(text[start:])
     return schema
+
+
+def expert_prompt_paths() -> list[str]:
+    return sorted(glob.glob(os.path.join(PROMPTS_DIR, "experts", "*.txt")))
+
+
+class TestEveryExpertPromptFitsThePipeline(unittest.TestCase):
+
+    def test_every_expert_prompt_fills_with_only_pdf_text_and_opener_number(self):
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                template = f.read()
+            filled, error = build_extract_prompt(template, "COMPLAINT TEXT", 2)
+            self.assertIsNone(error, f"{path}: {error}")
+            self.assertIn("COMPLAINT TEXT", filled, path)
+            self.assertNotIn("{{", filled, f"{path}: a placeholder was left unfilled")
+            self.assertNotIn("$json", template, f"{path}: n8n placeholder syntax left in the prompt")
+
+    def test_every_expert_prompt_asks_for_a_list_of_attorneys(self):
+        for path in expert_prompt_paths():
+            attorneys = prompt_schema(path).get("attorneys")
+            self.assertIsInstance(attorneys, list, f"{path}: attorneys is not a list")
+            self.assertEqual(set(attorneys[0]), {"first_name", "last_name", "email", "phone", "address"}, path)
+
+    def test_every_expert_prompt_uses_the_shared_column_names(self):
+        for path in expert_prompt_paths():
+            schema = prompt_schema(path)
+            self.assertIn("case_name_short", schema, path)
+            self.assertIn("outreach_one_liner", schema, path)
+            self.assertNotIn("confidence", schema, f"{path}: use confidence_score")
+            for key in schema:
+                if key.startswith("case_name_short"):
+                    self.assertEqual(key, "case_name_short", f"{path}: use case_name_short, not {key}")
+
+    def test_every_expert_prompt_scores_fit_on_the_scale_that_triggers_email_lookup(self):
+        for path in expert_prompt_paths():
+            schema = prompt_schema(path)
+            for key in ("expert_fit", "fit_reason", "confidence_score"):
+                self.assertIn(key, schema, f"{path}: {key} missing")
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            for value in ("strong_fit", "possible_fit", "not_fit"):
+                self.assertIn(value, text, f"{path}: expert_fit value {value} never mentioned")
+
+    def test_no_expert_prompt_contains_drafting_leftovers(self):
+        leftovers = [r"SAME AS (YOUR )?ORIGINAL", r"contentReference", r"oaicite", r"\]\(https?://",
+                     r"^Yes\. I", r"^This version is tailored", r"^Paste this"]
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            for pattern in leftovers:
+                self.assertIsNone(re.search(pattern, text, re.MULTILINE), f"{path}: leftover {pattern}")
+
+    def test_one_liner_templates_do_not_hard_code_the_first_opener(self):
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if "If template 1" in text or "is not used by this prompt" in text:
+                continue
+            hard_coded = text.count('"I came across [CASE_NAME]') - text.count('1. "I came across [CASE_NAME]"')
+            self.assertEqual(hard_coded, 0, f"{path}: a template starts with opener 1 instead of [OPENER]")
+
+    def test_every_expert_prompt_has_at_most_one_outreach_rules_section(self):
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            headers = re.findall(r"^#* *OUTREACH ONE[- ]LINER RULES", text, re.MULTILINE | re.IGNORECASE)
+            self.assertLessEqual(len(headers), 1, path)
+
+    def test_every_expert_prompt_uses_the_shared_case_name_format(self):
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("Party A v Party B", f.read(), path)
+
+    def test_no_two_expert_prompts_are_copies_of_each_other(self):
+        lines = {}
+        for path in expert_prompt_paths():
+            with open(path, encoding="utf-8") as f:
+                lines[path] = {line.strip() for line in f if len(line.strip()) > 20}
+        for a, b in itertools.combinations(lines, 2):
+            shared = len(lines[a] & lines[b]) / min(len(lines[a]), len(lines[b]))
+            self.assertLess(shared, 0.9, f"{a} and {b} share {shared:.0%} of their lines")
 
 
 class TestEveryPromptFieldIsWritten(unittest.TestCase):
